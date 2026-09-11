@@ -713,7 +713,39 @@ def main(realm: int = REALM_ID, resources: Optional[List[int]] = None,
                                   csv_path=csv_path, quiet=quiet))
 
 
-# Ejecuta el análisis con la configuración de arriba (recursos 1-115, calidades 0-5).
-# En Colab, `resultado` queda disponible como DataFrame para seguir explorándolo.
+def _en_notebook() -> bool:
+    """Detecta si el módulo corre dentro de un kernel de Jupyter/Colab."""
+    return "ipykernel" in sys.modules or "google.colab" in sys.modules
+
+
 if __name__ == "__main__":
-    resultado = main()
+    if _en_notebook():
+        # En un notebook (Colab/Jupyter) no hay línea de comandos real: se usa
+        # la configuración de arriba tal cual. `resultado` queda disponible
+        # como DataFrame para seguir explorándolo en otra celda.
+        resultado = main()
+    else:
+        # Terminal / VPS: permite ajustar la corrida sin editar el archivo.
+        import argparse
+
+        parser = argparse.ArgumentParser(
+            description="Analizador de mercado de SimCompanies (API de Simco Tools)")
+        parser.add_argument("--realm", type=int, default=REALM_ID, help="ID del realm")
+        parser.add_argument("--resources", type=str, default=None,
+                            help="IDs de recursos separados por coma (ej: 74,1,10). Por defecto: 1-115")
+        parser.add_argument("--qualities", type=str, default=None,
+                            help="Calidades separadas por coma (ej: 0,1,2). Por defecto: 0-5")
+        parser.add_argument("--csv", type=str, default=None, help="Guarda el resultado en un CSV")
+        parser.add_argument("--concurrencia", type=int, default=None,
+                            help=f"Peticiones HTTP simultáneas como máximo (por defecto {CONCURRENCIA_MAXIMA})")
+        parser.add_argument("--quiet", action="store_true", help="Silencia los logs de depuración")
+        args = parser.parse_args()
+
+        if args.concurrencia:
+            CONCURRENCIA_MAXIMA = args.concurrencia
+
+        resources = [int(x) for x in args.resources.split(",") if x.strip()] if args.resources else None
+        qualities = [int(x) for x in args.qualities.split(",") if x.strip()] if args.qualities else None
+
+        resultado = main(realm=args.realm, resources=resources, qualities=qualities,
+                         csv_path=args.csv, quiet=args.quiet)
