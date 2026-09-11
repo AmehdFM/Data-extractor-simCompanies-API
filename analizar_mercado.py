@@ -29,7 +29,6 @@ Dependencias: requests, pandas, numpy, scipy (tabulate opcional)
 
 from __future__ import annotations
 
-import json
 import math
 import sys
 import time
@@ -84,12 +83,10 @@ USAR_VWAP_PONDERADO = True              # promedio = vwap ponderado por volumen
 TIMEOUT = 15                            # segundos por petición
 MAX_REINTENTOS = 5                      # reintentos ante fallo de red / 429 / 5xx
 BACKOFF_BASE = 2.0                      # segundos: 2, 4, 8, 16, 32 ... (si no hay Retry-After)
-DELAY_ENTRE_LLAMADAS = 0.5              # pausa fija entre peticiones consecutivas
-                                         # (secuencial: una petición a la vez, esto es
-                                         # lo que evita saturar la API / el 429)
-
-VERBOSE = False                         # True para ver logs de progreso y la
-                                         # respuesta cruda de /market/prices
+DELAY_ENTRE_LLAMADAS = 1.2              # pausa fija entre peticiones consecutivas
+                                         # (secuencial: una petición a la vez; subida
+                                         # de 0.5 a 1.2 para evitar el 429 de entrada,
+                                         # no solo reintentar después de que ocurra)
 
 
 # ---------------------------------------------------------------------------
@@ -102,21 +99,6 @@ _SESSION.headers.update({"Accept": "application/json",
 
 # Caché de /resources/{id} para no repetir la llamada por cada calidad.
 _CACHE_RECURSOS: Dict[int, Dict[str, Any]] = {}
-
-# Solo se vuelca la primera respuesta cruda del endpoint de prices (modo verbose).
-_SCHEMA_PRICES_MOSTRADO = False
-
-
-def log(msg: str) -> None:
-    """Imprime un mensaje solo en modo verbose (progreso / depuración)."""
-    if VERBOSE:
-        print(msg, file=sys.stderr)
-
-
-def warn(msg: str) -> None:
-    """Avisos de error: solo en modo verbose (por defecto el script es silencioso)."""
-    if VERBOSE:
-        print(f"  ! {msg}", file=sys.stderr)
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -158,36 +140,27 @@ def _get_json(path: str, permitir_404: bool = True) -> Optional[Any]:
     for intento in range(1, MAX_REINTENTOS + 1):
         try:
             resp = _SESSION.get(url, timeout=TIMEOUT)
-        except requests.RequestException as exc:
+        except requests.RequestException:
             if intento == MAX_REINTENTOS:
-                warn(f"{path}: fallo de red tras {intento} intentos ({exc})")
                 return None
-            espera = BACKOFF_BASE * (2 ** (intento - 1))
-            log(f"    red KO ({exc.__class__.__name__}), reintento en {espera:.1f}s")
-            time.sleep(espera)
+            time.sleep(BACKOFF_BASE * (2 ** (intento - 1)))
             continue
 
         if resp.status_code == 404 and permitir_404:
-            log(f"    404 en {path} (no existe, se omite)")
             return None
 
         if resp.status_code == 429 or resp.status_code >= 500:
             if intento == MAX_REINTENTOS:
-                warn(f"{path}: HTTP {resp.status_code} tras {intento} intentos")
                 return None
-            espera = _espera_retry_after(resp, intento)
-            log(f"    HTTP {resp.status_code}, reintento en {espera:.1f}s")
-            time.sleep(espera)
+            time.sleep(_espera_retry_after(resp, intento))
             continue
 
         if not resp.ok:
-            warn(f"{path}: HTTP {resp.status_code} — {resp.text[:120]}")
             return None
 
         try:
             return resp.json()
         except ValueError:
-            warn(f"{path}: la respuesta no es JSON válido — {resp.text[:120]}")
             return None
     return None
 
@@ -221,7 +194,6 @@ def get_candlesticks(realm: int, resource_id: int, quality: int) -> Optional[pd.
 
     df = pd.DataFrame(velas)
     if "date" not in df.columns:
-        warn(f"recurso {resource_id} q{quality}: candlesticks sin campo 'date'")
         return None
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True)
@@ -353,26 +325,14 @@ def get_current_price(realm: int, resource_id: int, quality: int) -> Optional[Di
 
     Devuelve {'precio_actual', 'precio_compra', 'precio_venta', 'tiene_buy_sell'}
     o None si no se pudo obtener/parsear ningún precio.
-
-    En modo verbose, la primera respuesta cruda se imprime para poder ajustar
-    el parseo si el schema no es el esperado.
     """
-    global _SCHEMA_PRICES_MOSTRADO
-
     payload = _get_json(f"/realms/{realm}/market/prices/{resource_id}/{quality}")
     time.sleep(DELAY_ENTRE_LLAMADAS)
     if payload is None:
         return None
 
-    if VERBOSE and not _SCHEMA_PRICES_MOSTRADO:
-        _SCHEMA_PRICES_MOSTRADO = True
-        log(f"\n--- [DEBUG] Respuesta cruda de /market/prices (recurso {resource_id}, calidad {quality}) ---")
-        log(json.dumps(payload, indent=2, ensure_ascii=False)[:2000])
-        log("--- [DEBUG] fin de la respuesta cruda ---\n")
-
     compra, venta, unico = _extraer_precios(payload)
     if compra is None and venta is None and unico is None:
-        warn(f"recurso {resource_id} q{quality}: no se encontró ningún precio en la respuesta ({str(payload)[:120]})")
         return None
 
     tiene_buy_sell = compra is not None and venta is not None
@@ -429,9 +389,6 @@ def get_resource_info(realm: int, resource_id: int) -> Dict[str, Any]:
             info["transportation"] = float(transporte) if transporte is not None else None
         except (TypeError, ValueError):
             info["transportation"] = None
-
-    if info["transportation"] is None:
-        warn(f"recurso {resource_id}: sin campo 'transportation'; el coste de transporte se asumirá 0")
 
     _CACHE_RECURSOS[resource_id] = info
     return info
@@ -506,12 +463,10 @@ def analyze_resource(realm: int, resource_id: int, quality: int,
     # --- Paso 1: histórico ---
     df = get_candlesticks(realm, resource_id, quality)
     if df is None or len(df) < MIN_PUNTOS_HISTORICO:
-        log(f"  q{quality}: sin histórico suficiente, se omite")
         return None
 
     promedio = promedio_historico(df)
     if promedio <= 0:
-        log(f"  q{quality}: promedio histórico no válido, se omite")
         return None
     tendencia, pendiente_rel = calcular_tendencia(df, promedio)
     mm7 = media_movil(df)
@@ -519,7 +474,6 @@ def analyze_resource(realm: int, resource_id: int, quality: int,
     # --- Paso 2: precio actual ---
     precios = get_current_price(realm, resource_id, quality)
     if precios is None:
-        log(f"  q{quality}: sin precio actual, se omite")
         return None
 
     # --- Paso 3: rentabilidad ---
@@ -592,8 +546,8 @@ def mostrar_resultado(df: pd.DataFrame) -> None:
     """
     Muestra el resultado como tabla de pandas coloreada por categoría (bonito
     en un notebook/Colab). Si no hay entorno de notebook disponible, cae a
-    tabulate o a un print plano. Es lo único que se imprime por defecto
-    (VERBOSE=False): nada de progreso, solo este resultado final.
+    tabulate o a un print plano. Es lo único que imprime el script: no hay
+    logs de progreso ni de error en ningún punto de la corrida.
     """
     if df.empty:
         print("No se pudo analizar ninguna combinación (recurso, calidad).")
@@ -648,17 +602,12 @@ def mostrar_resultado(df: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 def main(realm: int = REALM_ID, resources: Optional[List[int]] = None,
-         qualities: Optional[List[int]] = None, csv_path: Optional[str] = None,
-         verbose: Optional[bool] = None) -> pd.DataFrame:
+         qualities: Optional[List[int]] = None, csv_path: Optional[str] = None) -> pd.DataFrame:
     """
-    Corre el análisis completo de forma secuencial (una petición a la vez) y
-    devuelve el DataFrame final. Por defecto no imprime nada de progreso:
-    solo el resultado (tabla + resumen) al terminar.
+    Corre el análisis completo de forma secuencial (una petición a la vez, con
+    pausa entre llamadas) y devuelve el DataFrame final. No imprime nada
+    mientras corre: solo el resultado (tabla + resumen) al terminar.
     """
-    global VERBOSE
-    if verbose is not None:
-        VERBOSE = verbose
-
     resources = resources or RESOURCE_IDS
     qualities = qualities or QUALITIES
 
@@ -666,17 +615,14 @@ def main(realm: int = REALM_ID, resources: Optional[List[int]] = None,
     for resource_id in resources:
         # Paso 3 (parte fija): una sola llamada por recurso, no por calidad.
         info = get_resource_info(realm, resource_id)
-        log(f"[{resource_id}] {info['nombre']} (transporte={info['transportation']}, fase={info['phase']})")
 
         for quality in qualities:
             try:
                 fila = analyze_resource(realm, resource_id, quality, info)
-            except Exception as exc:  # ninguna calidad debe tumbar el script
-                warn(f"recurso {resource_id} q{quality}: error inesperado ({exc})")
+            except Exception:  # ninguna calidad debe tumbar el script
                 continue
             if fila is not None:
                 filas.append(fila)
-                log(f"  q{quality}: {fila['precio_actual']:.2f} ({fila['%_vs_promedio']:+.1f}% vs prom.) {fila['tendencia']} -> {', '.join(fila['categorias'])}")
 
     df = construir_tabla(filas)
     mostrar_resultado(df)
@@ -713,7 +659,6 @@ if __name__ == "__main__":
         parser.add_argument("--csv", type=str, default=None, help="Guarda el resultado en un CSV")
         parser.add_argument("--delay", type=float, default=None,
                             help=f"Pausa en segundos entre peticiones (por defecto {DELAY_ENTRE_LLAMADAS})")
-        parser.add_argument("--verbose", action="store_true", help="Muestra logs de progreso y depuración")
         args = parser.parse_args()
 
         if args.delay is not None:
@@ -722,5 +667,4 @@ if __name__ == "__main__":
         resources = [int(x) for x in args.resources.split(",") if x.strip()] if args.resources else None
         qualities = [int(x) for x in args.qualities.split(",") if x.strip()] if args.qualities else None
 
-        resultado = main(realm=args.realm, resources=resources, qualities=qualities,
-                         csv_path=args.csv, verbose=args.verbose)
+        resultado = main(realm=args.realm, resources=resources, qualities=qualities, csv_path=args.csv)
