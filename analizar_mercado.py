@@ -58,14 +58,10 @@ BASE_URL = "https://api.simcotools.com/v1"
 
 REALM_ID: int = 1                       # Realm (mundo) a analizar
 
-# IDs de recursos a analizar. Añade o quita IDs sin tocar el resto del código.
-RESOURCE_IDS: List[int] = [
-    1,    # Power
-    10,   # Crude oil
-    13,   # Transport
-    74,   # Methane
-    75,   # Carbon fiber
-]
+# IDs de recursos a analizar. Por defecto recorre todos los recursos del 1 al 115
+# (rango completo de IDs de recursos en SimCompanies). Cambia el rango o pon una
+# lista explícita sin tocar el resto del código.
+RESOURCE_IDS: List[int] = list(range(1, 116))
 
 QUALITIES: List[int] = [0, 1, 2, 3, 4, 5]
 
@@ -355,15 +351,13 @@ def get_current_price(realm: int, resource_id: int, quality: int) -> Optional[Di
 
     if VERBOSE and not _SCHEMA_PRICES_MOSTRADO:
         _SCHEMA_PRICES_MOSTRADO = True
-        log("\n--- [DEBUG] Respuesta cruda de /market/prices "
-            f"(recurso {resource_id}, calidad {quality}) ---")
+        log(f"\n--- [DEBUG] Respuesta cruda de /market/prices (recurso {resource_id}, calidad {quality}) ---")
         log(json.dumps(payload, indent=2, ensure_ascii=False)[:2000])
         log("--- [DEBUG] fin de la respuesta cruda ---\n")
 
     compra, venta, unico = _extraer_precios(payload)
     if compra is None and venta is None and unico is None:
-        warn(f"recurso {resource_id} q{quality}: no se encontró ningún precio "
-             f"en la respuesta ({str(payload)[:120]})")
+        warn(f"recurso {resource_id} q{quality}: no se encontró ningún precio en la respuesta ({str(payload)[:120]})")
         return None
 
     tiene_buy_sell = compra is not None and venta is not None
@@ -422,8 +416,7 @@ def get_resource_info(realm: int, resource_id: int) -> Dict[str, Any]:
             info["transportation"] = None
 
     if info["transportation"] is None:
-        warn(f"recurso {resource_id}: sin campo 'transportation'; "
-             "el coste de transporte se asumirá 0")
+        warn(f"recurso {resource_id}: sin campo 'transportation'; el coste de transporte se asumirá 0")
 
     _CACHE_RECURSOS[resource_id] = info
     return info
@@ -595,9 +588,7 @@ def imprimir_tabla(df: pd.DataFrame) -> None:
     for categoria, n in df["categoría"].value_counts().sort_index().items():
         if n:
             print(f"  - {categoria}: {n}")
-    print(f"\nRegla de rentabilidad: transporte + compra <= venta * "
-          f"(1 - {IMPUESTO_VENTA:.0%})   |   transporte = "
-          f"{COSTO_TRANSPORTE_UNITARIO} x unidades de transporte")
+    print(f"\nRegla de rentabilidad: transporte + compra <= venta * (1 - {IMPUESTO_VENTA:.0%})   |   transporte = {COSTO_TRANSPORTE_UNITARIO} x unidades de transporte")
 
 
 # ---------------------------------------------------------------------------
@@ -606,8 +597,7 @@ def imprimir_tabla(df: pd.DataFrame) -> None:
 
 def parsear_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """Argumentos opcionales de línea de comandos (todos tienen default arriba)."""
-    p = argparse.ArgumentParser(description="Analizador de mercado de SimCompanies "
-                                            "(API de Simco Tools)")
+    p = argparse.ArgumentParser(description="Analizador de mercado de SimCompanies (API de Simco Tools)")
     p.add_argument("--realm", type=int, default=REALM_ID, help="ID del realm")
     p.add_argument("--resources", type=str, default=None,
                    help="IDs de recursos separados por coma (ej: 74,1,10)")
@@ -631,15 +621,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     qualities = ([int(x) for x in args.qualities.split(",") if x.strip()]
                  if args.qualities else QUALITIES)
 
-    print(f"Analizando realm {realm} | {len(resources)} recursos "
-          f"x {len(qualities)} calidades ...", file=sys.stderr)
+    print(f"Analizando realm {realm} | {len(resources)} recursos x {len(qualities)} calidades ...", file=sys.stderr)
 
     filas: List[Dict[str, Any]] = []
     for resource_id in resources:
         # Paso 3 (parte fija): una sola llamada por recurso, no por calidad.
         info = get_resource_info(realm, resource_id)
-        log(f"\n[{resource_id}] {info['nombre']} "
-            f"(transporte={info['transportation']}, fase={info['phase']})")
+        log(f"\n[{resource_id}] {info['nombre']} (transporte={info['transportation']}, fase={info['phase']})")
 
         for quality in qualities:
             try:
@@ -649,9 +637,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 continue
             if fila is not None:
                 filas.append(fila)
-                log(f"  q{quality}: {fila['precio_actual']:.2f} "
-                    f"({fila['%_vs_promedio']:+.1f}% vs prom.) "
-                    f"{fila['tendencia']} -> {', '.join(fila['categorias'])}")
+                log(f"  q{quality}: {fila['precio_actual']:.2f} ({fila['%_vs_promedio']:+.1f}% vs prom.) {fila['tendencia']} -> {', '.join(fila['categorias'])}")
 
     df = construir_tabla(filas)
     imprimir_tabla(df)
