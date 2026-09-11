@@ -8,43 +8,36 @@ Analiza el mercado de SimCompanies usando la API pública de Simco Tools
 (https://api.simcotools.com) para decidir qué recursos conviene COMPRAR,
 VENDER o VIGILAR.
 
-Versión asíncrona: todas las combinaciones (recurso, calidad) se piden en
-paralelo con aiohttp (limitadas por un semáforo para no saturar la API), en
-vez de una petición secuencial tras otra. Pensado para correr en Google
-Colab (usa await de nivel superior de forma segura vía nest_asyncio) o como
-script normal (`python analizar_mercado.py`).
+Versión secuencial (una petición a la vez, con pausa entre llamadas y
+backoff en 429) para evitar el rate-limiting de la API. Por defecto no
+imprime nada de lo que va haciendo: solo el resultado final como tabla de
+pandas. Pensado para correr en Google Colab o como script normal
+(`python analizar_mercado.py`).
 
 Flujo:
-  1. Descarga el histórico de precios (candlesticks diarios) y el precio
-     actual de cada combinación (recurso, calidad) EN PARALELO.
-  2. Calcula promedio histórico (VWAP ponderado), media móvil de 7 días y
-     tendencia (regresión lineal) a partir del histórico.
+  1. Descarga el histórico de precios (candlesticks diarios) de cada
+     combinación (recurso, calidad) y calcula promedio, media móvil y tendencia.
+  2. Consulta el precio actual de cada combinación con histórico válido.
   3. Calcula rentabilidad teniendo en cuenta el coste de transporte y el
      impuesto sobre la venta.
   4. Clasifica cada ítem (COMPRAR AHORA / BAJISTA - VIGILAR / ALCISTA - VENDER)
      y lo muestra como tabla de pandas con formato coloreado.
 
-Dependencias: aiohttp, pandas, numpy, scipy, nest_asyncio (tabulate opcional)
-    pip install aiohttp pandas numpy scipy nest_asyncio tabulate
+Dependencias: requests, pandas, numpy, scipy (tabulate opcional)
+    pip install requests pandas numpy scipy tabulate
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import math
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
-import aiohttp
 import numpy as np
 import pandas as pd
-
-try:  # nest_asyncio permite anidar asyncio.run() dentro del loop de Colab/Jupyter
-    import nest_asyncio
-    nest_asyncio.apply()
-except ImportError:  # pragma: no cover
-    pass
+import requests
 
 try:  # scipy es opcional: si no está, se usa numpy.polyfit como respaldo
     from scipy import stats as scipy_stats
@@ -87,40 +80,43 @@ VENTANA_MEDIA_MOVIL = 7                 # días de la media móvil
 MIN_PUNTOS_HISTORICO = 3                # mínimo de velas para analizar
 USAR_VWAP_PONDERADO = True              # promedio = vwap ponderado por volumen
 
-# --- Parámetros de red / concurrencia --------------------------------------
+# --- Parámetros de red -------------------------------------------------
 TIMEOUT = 15                            # segundos por petición
-MAX_REINTENTOS = 3                      # reintentos ante fallo de red / 5xx / timeout
-BACKOFF_BASE = 1.5                      # segundos: 1.5, 3.0, 6.0 ...
-CONCURRENCIA_MAXIMA = 20                # peticiones HTTP simultáneas como máximo
-                                         # (sustituye al delay secuencial: aquí lo que
-                                         # evita saturar la API es el semáforo, no una
-                                         # pausa entre llamadas)
+MAX_REINTENTOS = 5                      # reintentos ante fallo de red / 429 / 5xx
+BACKOFF_BASE = 2.0                      # segundos: 2, 4, 8, 16, 32 ... (si no hay Retry-After)
+DELAY_ENTRE_LLAMADAS = 0.5              # pausa fija entre peticiones consecutivas
+                                         # (secuencial: una petición a la vez, esto es
+                                         # lo que evita saturar la API / el 429)
 
-VERBOSE = True                          # imprime logs y respuestas crudas
+VERBOSE = False                         # True para ver logs de progreso y la
+                                         # respuesta cruda de /market/prices
 
 
 # ---------------------------------------------------------------------------
 # UTILIDADES INTERNAS
 # ---------------------------------------------------------------------------
 
-# Caché de /resources/{id}: se llena una vez por recurso antes de lanzar las
-# tareas por calidad, así que no necesita lock (no hay dos corutinas
-# escribiendo la misma clave a la vez).
+_SESSION = requests.Session()
+_SESSION.headers.update({"Accept": "application/json",
+                         "User-Agent": "analizar_mercado.py/3.0-sequential"})
+
+# Caché de /resources/{id} para no repetir la llamada por cada calidad.
 _CACHE_RECURSOS: Dict[int, Dict[str, Any]] = {}
 
-# Solo se vuelca la primera respuesta cruda del endpoint de prices.
+# Solo se vuelca la primera respuesta cruda del endpoint de prices (modo verbose).
 _SCHEMA_PRICES_MOSTRADO = False
 
 
 def log(msg: str) -> None:
-    """Imprime un mensaje solo en modo verbose."""
+    """Imprime un mensaje solo en modo verbose (progreso / depuración)."""
     if VERBOSE:
         print(msg, file=sys.stderr)
 
 
 def warn(msg: str) -> None:
-    """Avisos: siempre se muestran (por stderr, para no ensuciar la tabla)."""
-    print(f"  ! {msg}", file=sys.stderr)
+    """Avisos de error: solo en modo verbose (por defecto el script es silencioso)."""
+    if VERBOSE:
+        print(f"  ! {msg}", file=sys.stderr)
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -136,60 +132,63 @@ def _to_float(value: Any) -> Optional[float]:
     return f
 
 
-async def _get_json_async(session: aiohttp.ClientSession, sem: asyncio.Semaphore,
-                          path: str, permitir_404: bool = True) -> Optional[Any]:
+def _espera_retry_after(resp: requests.Response, intento: int) -> float:
     """
-    GET async genérico contra la API, con timeout, reintentos y backoff
-    exponencial, limitado por `sem` para no lanzar cientos de peticiones a la
-    vez. Nunca lanza excepción: el script no debe romperse porque una
-    calidad concreta no exista.
+    Cuánto esperar antes de reintentar: si la API manda el header
+    `Retry-After` (segundos, como suele venir en un 429) se respeta ese
+    valor; si no, se usa backoff exponencial.
+    """
+    header = resp.headers.get("Retry-After")
+    if header:
+        try:
+            return max(float(header), 0.5)
+        except ValueError:
+            pass
+    return BACKOFF_BASE * (2 ** (intento - 1))
+
+
+def _get_json(path: str, permitir_404: bool = True) -> Optional[Any]:
+    """
+    GET secuencial contra la API: una petición a la vez, con timeout,
+    reintentos y backoff (respetando `Retry-After` en 429). Nunca lanza
+    excepción: el script no debe romperse porque una calidad concreta no
+    exista o una llamada falle.
     """
     url = f"{BASE_URL}{path}"
     for intento in range(1, MAX_REINTENTOS + 1):
         try:
-            async with sem:
-                async with session.get(url) as resp:
-                    if resp.status == 404 and permitir_404:
-                        log(f"    404 en {path} (no existe, se omite)")
-                        return None
-
-                    if resp.status == 429 or resp.status >= 500:
-                        espera = BACKOFF_BASE * (2 ** (intento - 1))
-                        if intento == MAX_REINTENTOS:
-                            warn(f"{path}: HTTP {resp.status} tras {intento} intentos")
-                            return None
-                        log(f"    HTTP {resp.status}, reintento en {espera:.1f}s")
-                        await asyncio.sleep(espera)
-                        continue
-
-                    if resp.status >= 400:
-                        texto = await resp.text()
-                        warn(f"{path}: HTTP {resp.status} — {texto[:120]}")
-                        return None
-
-                    try:
-                        # content_type=None: algunas APIs no declaran
-                        # "application/json" en el header y aiohttp, a
-                        # diferencia de requests, es estricto por defecto.
-                        return await resp.json(content_type=None)
-                    except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
-                        texto = await resp.text()
-                        warn(f"{path}: la respuesta no es JSON válido — {texto[:120]}")
-                        return None
-        except asyncio.TimeoutError:
-            espera = BACKOFF_BASE * (2 ** (intento - 1))
-            if intento == MAX_REINTENTOS:
-                warn(f"{path}: timeout tras {intento} intentos")
-                return None
-            log(f"    timeout, reintento en {espera:.1f}s")
-            await asyncio.sleep(espera)
-        except aiohttp.ClientError as exc:
-            espera = BACKOFF_BASE * (2 ** (intento - 1))
+            resp = _SESSION.get(url, timeout=TIMEOUT)
+        except requests.RequestException as exc:
             if intento == MAX_REINTENTOS:
                 warn(f"{path}: fallo de red tras {intento} intentos ({exc})")
                 return None
+            espera = BACKOFF_BASE * (2 ** (intento - 1))
             log(f"    red KO ({exc.__class__.__name__}), reintento en {espera:.1f}s")
-            await asyncio.sleep(espera)
+            time.sleep(espera)
+            continue
+
+        if resp.status_code == 404 and permitir_404:
+            log(f"    404 en {path} (no existe, se omite)")
+            return None
+
+        if resp.status_code == 429 or resp.status_code >= 500:
+            if intento == MAX_REINTENTOS:
+                warn(f"{path}: HTTP {resp.status_code} tras {intento} intentos")
+                return None
+            espera = _espera_retry_after(resp, intento)
+            log(f"    HTTP {resp.status_code}, reintento en {espera:.1f}s")
+            time.sleep(espera)
+            continue
+
+        if not resp.ok:
+            warn(f"{path}: HTTP {resp.status_code} — {resp.text[:120]}")
+            return None
+
+        try:
+            return resp.json()
+        except ValueError:
+            warn(f"{path}: la respuesta no es JSON válido — {resp.text[:120]}")
+            return None
     return None
 
 
@@ -197,16 +196,15 @@ async def _get_json_async(session: aiohttp.ClientSession, sem: asyncio.Semaphore
 # PASO 1 — HISTÓRICO DE PRECIOS
 # ---------------------------------------------------------------------------
 
-async def get_candlesticks(session: aiohttp.ClientSession, sem: asyncio.Semaphore,
-                           realm: int, resource_id: int, quality: int) -> Optional[pd.DataFrame]:
+def get_candlesticks(realm: int, resource_id: int, quality: int) -> Optional[pd.DataFrame]:
     """
     GET /realms/{realm}/market/resources/{resource}/{quality}/candlesticks
 
     Devuelve un DataFrame con columnas [date, open, low, high, close, volume, vwap]
     ordenado por fecha, o None si la calidad no existe o no hay datos.
     """
-    data = await _get_json_async(
-        session, sem, f"/realms/{realm}/market/resources/{resource_id}/{quality}/candlesticks")
+    data = _get_json(f"/realms/{realm}/market/resources/{resource_id}/{quality}/candlesticks")
+    time.sleep(DELAY_ENTRE_LLAMADAS)
     if data is None:
         return None
 
@@ -349,20 +347,20 @@ def _extraer_precios(payload: Any) -> Tuple[Optional[float], Optional[float], Op
     return compra, venta, unico
 
 
-async def get_current_price(session: aiohttp.ClientSession, sem: asyncio.Semaphore,
-                            realm: int, resource_id: int, quality: int) -> Optional[Dict[str, Any]]:
+def get_current_price(realm: int, resource_id: int, quality: int) -> Optional[Dict[str, Any]]:
     """
     GET /realms/{realm}/market/prices/{resource}/{quality}
 
     Devuelve {'precio_actual', 'precio_compra', 'precio_venta', 'tiene_buy_sell'}
     o None si no se pudo obtener/parsear ningún precio.
 
-    La primera respuesta cruda se imprime en modo verbose para poder ajustar el
-    parseo si el schema no es el esperado.
+    En modo verbose, la primera respuesta cruda se imprime para poder ajustar
+    el parseo si el schema no es el esperado.
     """
     global _SCHEMA_PRICES_MOSTRADO
 
-    payload = await _get_json_async(session, sem, f"/realms/{realm}/market/prices/{resource_id}/{quality}")
+    payload = _get_json(f"/realms/{realm}/market/prices/{resource_id}/{quality}")
+    time.sleep(DELAY_ENTRE_LLAMADAS)
     if payload is None:
         return None
 
@@ -408,8 +406,7 @@ async def get_current_price(session: aiohttp.ClientSession, sem: asyncio.Semapho
 # PASO 3 — INFO DEL RECURSO Y RENTABILIDAD
 # ---------------------------------------------------------------------------
 
-async def get_resource_info(session: aiohttp.ClientSession, sem: asyncio.Semaphore,
-                            realm: int, resource_id: int) -> Dict[str, Any]:
+def get_resource_info(realm: int, resource_id: int) -> Dict[str, Any]:
     """
     GET /realms/{realm}/resources/{resource}
 
@@ -419,7 +416,8 @@ async def get_resource_info(session: aiohttp.ClientSession, sem: asyncio.Semapho
     if resource_id in _CACHE_RECURSOS:
         return _CACHE_RECURSOS[resource_id]
 
-    payload = await _get_json_async(session, sem, f"/realms/{realm}/resources/{resource_id}")
+    payload = _get_json(f"/realms/{realm}/resources/{resource_id}")
+    time.sleep(DELAY_ENTRE_LLAMADAS)
 
     info = {"nombre": f"#{resource_id}", "transportation": None, "phase": None}
     if isinstance(payload, dict):
@@ -498,31 +496,30 @@ def classify(fila: Dict[str, Any]) -> List[str]:
     return categorias or [CAT_SIN_SENAL]
 
 
-async def analyze_resource(session: aiohttp.ClientSession, sem: asyncio.Semaphore,
-                           realm: int, resource_id: int, quality: int,
-                           info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def analyze_resource(realm: int, resource_id: int, quality: int,
+                     info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Analiza una combinación (recurso, calidad): pide histórico y precio actual
-    EN PARALELO (de golpe, no uno tras otro), y si ambos son válidos calcula
+    Analiza una combinación (recurso, calidad): histórico + precio actual +
     rentabilidad + clasificación. Devuelve la fila del informe o None si la
     combinación no es analizable (calidad inexistente, sin histórico, sin precio).
     """
-    # --- Pasos 1 y 2 en paralelo: histórico y precio actual a la vez ---
-    df, precios = await asyncio.gather(
-        get_candlesticks(session, sem, realm, resource_id, quality),
-        get_current_price(session, sem, realm, resource_id, quality),
-    )
-
+    # --- Paso 1: histórico ---
+    df = get_candlesticks(realm, resource_id, quality)
     if df is None or len(df) < MIN_PUNTOS_HISTORICO:
+        log(f"  q{quality}: sin histórico suficiente, se omite")
         return None
 
     promedio = promedio_historico(df)
     if promedio <= 0:
+        log(f"  q{quality}: promedio histórico no válido, se omite")
         return None
     tendencia, pendiente_rel = calcular_tendencia(df, promedio)
     mm7 = media_movil(df)
 
+    # --- Paso 2: precio actual ---
+    precios = get_current_price(realm, resource_id, quality)
     if precios is None:
+        log(f"  q{quality}: sin precio actual, se omite")
         return None
 
     # --- Paso 3: rentabilidad ---
@@ -595,10 +592,11 @@ def mostrar_resultado(df: pd.DataFrame) -> None:
     """
     Muestra el resultado como tabla de pandas coloreada por categoría (bonito
     en un notebook/Colab). Si no hay entorno de notebook disponible, cae a
-    tabulate o a un print plano.
+    tabulate o a un print plano. Es lo único que se imprime por defecto
+    (VERBOSE=False): nada de progreso, solo este resultado final.
     """
     if df.empty:
-        print("\nNo se pudo analizar ninguna combinación (recurso, calidad).")
+        print("No se pudo analizar ninguna combinación (recurso, calidad).")
         return
 
     vista = df[COLUMNAS_TABLA].copy()
@@ -633,9 +631,6 @@ def mostrar_resultado(df: pd.DataFrame) -> None:
         vista_txt = vista.copy()
         for col, fmt in formatos.items():
             vista_txt[col] = vista_txt[col].map(lambda x, fmt=fmt: fmt.format(x) if pd.notna(x) else "n/d")
-        print("\n" + "=" * 110)
-        print("RESULTADO DEL ANÁLISIS DE MERCADO")
-        print("=" * 110)
         if tabulate is not None:
             print(tabulate(vista_txt, headers="keys", tablefmt="github", showindex=False))
         else:
@@ -652,44 +647,36 @@ def mostrar_resultado(df: pd.DataFrame) -> None:
 # MAIN
 # ---------------------------------------------------------------------------
 
-async def main_async(realm: int = REALM_ID, resources: Optional[List[int]] = None,
-                     qualities: Optional[List[int]] = None, csv_path: Optional[str] = None,
-                     quiet: bool = False) -> pd.DataFrame:
+def main(realm: int = REALM_ID, resources: Optional[List[int]] = None,
+         qualities: Optional[List[int]] = None, csv_path: Optional[str] = None,
+         verbose: Optional[bool] = None) -> pd.DataFrame:
+    """
+    Corre el análisis completo de forma secuencial (una petición a la vez) y
+    devuelve el DataFrame final. Por defecto no imprime nada de progreso:
+    solo el resultado (tabla + resumen) al terminar.
+    """
     global VERBOSE
-    if quiet:
-        VERBOSE = False
+    if verbose is not None:
+        VERBOSE = verbose
 
     resources = resources or RESOURCE_IDS
     qualities = qualities or QUALITIES
-    sem = asyncio.Semaphore(CONCURRENCIA_MAXIMA)
 
-    print(f"Analizando realm {realm} | {len(resources)} recursos x {len(qualities)} calidades (async, hasta {CONCURRENCIA_MAXIMA} peticiones simultáneas) ...", file=sys.stderr)
+    filas: List[Dict[str, Any]] = []
+    for resource_id in resources:
+        # Paso 3 (parte fija): una sola llamada por recurso, no por calidad.
+        info = get_resource_info(realm, resource_id)
+        log(f"[{resource_id}] {info['nombre']} (transporte={info['transportation']}, fase={info['phase']})")
 
-    connector = aiohttp.TCPConnector(limit=CONCURRENCIA_MAXIMA * 2)
-    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
-    headers = {"Accept": "application/json", "User-Agent": "analizar_mercado.py/2.0-async"}
-
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
-        # Info de cada recurso (transportation, nombre) — una sola llamada por
-        # recurso, todas en paralelo, antes de lanzar las tareas por calidad.
-        infos_lista = await asyncio.gather(
-            *(get_resource_info(session, sem, realm, rid) for rid in resources)
-        )
-        infos = dict(zip(resources, infos_lista))
-        for rid, info in infos.items():
-            log(f"[{rid}] {info['nombre']} (transporte={info['transportation']}, fase={info['phase']})")
-
-        # Todas las combinaciones (recurso, calidad) se piden de golpe; el
-        # semáforo dentro de _get_json_async limita cuántas peticiones HTTP
-        # están en vuelo a la vez.
-        combos = [(rid, q) for rid in resources for q in qualities]
-        resultados = await asyncio.gather(*(
-            analyze_resource(session, sem, realm, rid, q, infos[rid]) for rid, q in combos
-        ))
-
-    filas = [f for f in resultados if f is not None]
-    for f in filas:
-        log(f"  [{f['resource_id']}] q{f['quality']}: {f['precio_actual']:.2f} ({f['%_vs_promedio']:+.1f}% vs prom.) {f['tendencia']} -> {', '.join(f['categorias'])}")
+        for quality in qualities:
+            try:
+                fila = analyze_resource(realm, resource_id, quality, info)
+            except Exception as exc:  # ninguna calidad debe tumbar el script
+                warn(f"recurso {resource_id} q{quality}: error inesperado ({exc})")
+                continue
+            if fila is not None:
+                filas.append(fila)
+                log(f"  q{quality}: {fila['precio_actual']:.2f} ({fila['%_vs_promedio']:+.1f}% vs prom.) {fila['tendencia']} -> {', '.join(fila['categorias'])}")
 
     df = construir_tabla(filas)
     mostrar_resultado(df)
@@ -699,18 +686,6 @@ async def main_async(realm: int = REALM_ID, resources: Optional[List[int]] = Non
         print(f"\nResultado guardado en {csv_path}")
 
     return df
-
-
-def main(realm: int = REALM_ID, resources: Optional[List[int]] = None,
-         qualities: Optional[List[int]] = None, csv_path: Optional[str] = None,
-         quiet: bool = False) -> pd.DataFrame:
-    """
-    Envoltorio síncrono de main_async(): tanto en Colab/Jupyter (gracias a
-    nest_asyncio) como ejecutado como script normal, basta con llamar a
-    main() y esperar el DataFrame de vuelta.
-    """
-    return asyncio.run(main_async(realm=realm, resources=resources, qualities=qualities,
-                                  csv_path=csv_path, quiet=quiet))
 
 
 def _en_notebook() -> bool:
@@ -736,16 +711,16 @@ if __name__ == "__main__":
         parser.add_argument("--qualities", type=str, default=None,
                             help="Calidades separadas por coma (ej: 0,1,2). Por defecto: 0-5")
         parser.add_argument("--csv", type=str, default=None, help="Guarda el resultado en un CSV")
-        parser.add_argument("--concurrencia", type=int, default=None,
-                            help=f"Peticiones HTTP simultáneas como máximo (por defecto {CONCURRENCIA_MAXIMA})")
-        parser.add_argument("--quiet", action="store_true", help="Silencia los logs de depuración")
+        parser.add_argument("--delay", type=float, default=None,
+                            help=f"Pausa en segundos entre peticiones (por defecto {DELAY_ENTRE_LLAMADAS})")
+        parser.add_argument("--verbose", action="store_true", help="Muestra logs de progreso y depuración")
         args = parser.parse_args()
 
-        if args.concurrencia:
-            CONCURRENCIA_MAXIMA = args.concurrencia
+        if args.delay is not None:
+            DELAY_ENTRE_LLAMADAS = args.delay
 
         resources = [int(x) for x in args.resources.split(",") if x.strip()] if args.resources else None
         qualities = [int(x) for x in args.qualities.split(",") if x.strip()] if args.qualities else None
 
         resultado = main(realm=args.realm, resources=resources, qualities=qualities,
-                         csv_path=args.csv, quiet=args.quiet)
+                         csv_path=args.csv, verbose=args.verbose)
